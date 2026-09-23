@@ -15,6 +15,7 @@ from typing import Iterator
 from .schemas import (
     AnalysisMeta,
     AnalysisResult,
+    AnalysisRetentionResult,
     GuardBand,
     ProductOut,
     SiteCreate,
@@ -322,6 +323,56 @@ def list_analyses(site_id: int) -> list[AnalysisMeta]:
         )
         for r in rows
     ]
+
+
+def prune_analyses(site_id: int, keep: int) -> AnalysisRetentionResult:
+    """按 (created_at, id) 倒序保留该站点最近 keep 条分析，删除其余记录。
+
+    先选出保留集合（按 created_at、id 倒序的前 keep 条），随后在**同一个
+    事务**内删除旧分析的幂等登记行与分析记录本身（idempotency_keys 通过
+    analysis_id 外键关联分析；两表均开启 ON DELETE CASCADE，这里仍显式先删
+    登记行以保证删除意图清晰且不依赖级联时机）。任一步失败整个事务回滚，
+    已保留/已删除的记录都保持原状。返回被删除的分析 ID（升序）与清理后
+    剩余记录数；分析总数不超过 keep 时不删除任何记录。
+    """
+    with connect() as con:
+        kept_rows = con.execute(
+            "SELECT id FROM analyses WHERE site_id = ? ORDER BY created_at DESC, id DESC"
+            " LIMIT ?",
+            (site_id, keep),
+        ).fetchall()
+        kept_ids = [row["id"] for row in kept_rows]
+        if kept_ids:
+            placeholders = ",".join("?" for _ in kept_ids)
+            deleted_rows = con.execute(
+                f"SELECT id FROM analyses WHERE site_id = ? AND id NOT IN ({placeholders})"
+                " ORDER BY id",
+                (site_id, *kept_ids),
+            ).fetchall()
+        else:
+            deleted_rows = con.execute(
+                "SELECT id FROM analyses WHERE site_id = ? ORDER BY id", (site_id,)
+            ).fetchall()
+        deleted_ids = [row["id"] for row in deleted_rows]
+        if deleted_ids:
+            del_placeholders = ",".join("?" for _ in deleted_ids)
+            # 先删幂等登记行，再删分析记录；同一事务内一并提交或回滚
+            con.execute(
+                f"DELETE FROM idempotency_keys WHERE analysis_id IN ({del_placeholders})",
+                deleted_ids,
+            )
+            con.execute(
+                f"DELETE FROM analyses WHERE id IN ({del_placeholders})", deleted_ids
+            )
+        remaining = con.execute(
+            "SELECT COUNT(*) AS n FROM analyses WHERE site_id = ?", (site_id,)
+        ).fetchone()["n"]
+    return AnalysisRetentionResult(
+        site_id=site_id,
+        keep=keep,
+        deleted_analysis_ids=deleted_ids,
+        remaining_count=remaining,
+    )
 
 
 # ---------------------------------------------------------------- 跨站点批量查询

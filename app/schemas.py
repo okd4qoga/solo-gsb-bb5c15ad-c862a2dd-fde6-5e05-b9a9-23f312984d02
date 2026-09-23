@@ -100,6 +100,17 @@ class AnalysisMeta(BaseModel):
     product_count: int
 
 
+class AnalysisRetentionResult(BaseModel):
+    """历史清理结果：保留最近 keep 条分析后，实际删除与剩余的分析记录。"""
+
+    site_id: int
+    keep: int = Field(..., description="请求保留的最近分析条数（1～100）")
+    deleted_analysis_ids: list[int] = Field(
+        ..., description="本次被删除的分析记录 ID（升序）；无需删除时为空列表"
+    )
+    remaining_count: int = Field(..., description="清理后该站点剩余的分析记录数")
+
+
 class RiskGroup(BaseModel):
     """一个风险组：违规产物与其来源载频构成二部图后的一个连通分量。"""
 

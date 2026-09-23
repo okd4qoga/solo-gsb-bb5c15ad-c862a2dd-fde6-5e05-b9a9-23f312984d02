@@ -18,6 +18,7 @@ from .analysis import (
 from .schemas import (
     AnalysisMeta,
     AnalysisResult,
+    AnalysisRetentionResult,
     CarrierExclusionResult,
     CrossSiteConflictsRequest,
     CrossSiteConflictsResponse,
@@ -265,6 +266,35 @@ def list_site_analyses(site_id: int) -> list[AnalysisMeta]:
     if database.fetch_site(site_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
     return database.list_analyses(site_id)
+
+
+@app.delete(
+    "/sites/{site_id}/analyses/retention",
+    response_model=AnalysisRetentionResult,
+    tags=["analysis"],
+    summary="历史清理：按 created_at、id 倒序仅保留最近 keep 条分析",
+    description=(
+        "保留该站点按 **created_at、id 倒序** 的最近 `keep` 条分析，删除其余旧分析"
+        "记录及其幂等键（Idempotency-Key 登记行）。删除幂等键与分析记录在**同一个"
+        "SQLite 事务**内完成，任一步失败整批回滚，不会出现部分删除。分析总数不超过"
+        " `keep` 时不删除任何记录（`deleted_analysis_ids` 为空），接口可安全重试。\n\n"
+        "查询参数 `keep` 为 **1～100 的正整数**（缺失、非整数或越界 → 422）；"
+        "站点不存在 → 404。响应含 `deleted_analysis_ids`（被删除分析 ID，升序）与"
+        " `remaining_count`（清理后剩余分析数）。"
+    ),
+)
+def prune_site_analyses(
+    site_id: int,
+    keep: int = Query(
+        ...,
+        ge=1,
+        le=100,
+        description="保留的最近分析条数，取 1～100 的正整数",
+    ),
+) -> AnalysisRetentionResult:
+    if database.fetch_site(site_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    return database.prune_analyses(site_id, keep)
 
 
 @app.get(
