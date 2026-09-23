@@ -296,6 +296,40 @@ curl -X POST http://localhost:8000/sites/1/analysis
 建议客户端为每个"逻辑上的一次分析"生成一个稳定的键（如 UUID 或业务流水号），仅在重试
 同一逻辑请求时复用；需要再做一次独立分析时使用新键或省略该头。
 
+## 分析历史保留清理（retention）
+
+`DELETE /sites/{site_id}/analyses/retention?keep=k` 清理该站点的分析历史：按
+**`created_at`、`id` 倒序**（`created_at` 并列时以 id 较大者为更新，与"最近一次分析"
+语义一致）保留最近 `keep` 条分析，删除更旧的分析记录**及其在 `idempotency_keys` 中的
+幂等登记行**。查询参数 `keep` 为 **1～100 的正整数**（缺失、越界或非整数 → `422`；
+站点不存在 → `404`）。
+
+- **单事务整批回滚**：旧分析的幂等登记行与分析记录在**同一个数据库事务**内依次删除，
+  任一步失败即整体回滚，不会出现分析已删而幂等键残留（或反之）的中间状态。
+- **响应**：
+  - `deleted_analysis_ids`：被删除的旧分析记录 ID，按 id **升序**返回；
+  - `remaining_count`：清理后该站点剩余的分析记录总数。
+- **幂等再清理**：分析总数不超过 `keep` 时删除列表为空、`remaining_count` 为实际剩余
+  条数（站点尚无任何分析时为 0），不报错；对同一 `keep` 重复调用结果稳定。
+- **清理后再分析**：被删分析对应的幂等键随记录一并删除，之后用**相同键**再次
+  `POST /sites/{site_id}/analysis` 会作为新的首次请求执行并保存（`201`）；保留下来的
+  分析其幂等键不受影响，同键请求仍返回 `200` 重放。
+- **按站点隔离**：清理仅影响路径指定站点的分析，其他站点的分析与幂等键不变。
+
+```bash
+# 站点 1 现有 5 条分析：保留最近 3 条，删除最旧 2 条
+curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
+```
+
+```json
+{
+  "site_id": 1,
+  "keep": 3,
+  "deleted_analysis_ids": [1, 2],
+  "remaining_count": 3
+}
+```
+
 ## 校验规则（整批拒绝）
 
 - 载频必须为正整数 Hz 且**不得重复**；至少 1 个载频。
@@ -318,6 +352,7 @@ curl -X POST http://localhost:8000/sites/1/analysis
 | `POST` | `/sites/{site_id}/analysis` | 执行互调分析并保存结果，`201`；可选 `Idempotency-Key` 请求头：同站点重复/并发同键返回首次结果（`200`）且不新增记录，空白键 `422` |
 | `GET` | `/sites/{site_id}/analysis` | 查询该方案最近一次分析结果 |
 | `GET` | `/sites/{site_id}/analyses` | 列出该方案的全部分析记录 |
+| `DELETE` | `/sites/{site_id}/analyses/retention?keep=k` | 按 created_at、id 倒序保留最近 keep 条分析（1～100），单事务删除旧分析及其幂等键；站点不存在 → 404，参数非法 → 422 |
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
 | `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
 | `GET` | `/analyses/{analysis_id}/mitigation-plan?max_disabled=k` | 按已保存分析结果求最小停用载频集合（精确最小点覆盖，`max_disabled` 取 1～8；上限内无解返回 `feasible=false` 与未消除产物频率） |
@@ -350,6 +385,9 @@ curl -X POST http://localhost:8000/sites/1/analysis \
 # 查询已保存的方案与分析结果
 curl http://localhost:8000/sites/1
 curl http://localhost:8000/sites/1/analysis
+
+# 清理分析历史：按 created_at、id 倒序保留最近 3 条，其余旧分析及其幂等键在单事务中删除
+curl -X DELETE 'http://localhost:8000/sites/1/analyses/retention?keep=3'
 
 # 查询风险分组（违规产物与来源载频的连通分量）
 curl http://localhost:8000/analyses/1/risk-groups
@@ -439,8 +477,9 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（65 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
-# 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，以及幂等键的重复重放、失败回滚与并发去重）
+# 运行测试（75 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 新增载频禁用区间、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
+# 以及分析历史保留清理的倒序保留、幂等键联动删除与整批回滚）
 pytest
 
 # 启动服务，API 位于 http://127.0.0.1:8000
@@ -459,7 +498,7 @@ uvicorn app.main:app --reload
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库
   analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合
-  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、跨站点最近分析批量查询）
+  database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、历史保留单事务清理、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/
   test_api.py   # 端到端测试（TestClient + 临时数据库）

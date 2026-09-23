@@ -324,6 +324,49 @@ def list_analyses(site_id: int) -> list[AnalysisMeta]:
     ]
 
 
+def prune_analyses(site_id: int, keep: int) -> tuple[list[int], int] | None:
+    """单事务保留最近 keep 条分析，删除更旧分析及其幂等键登记行。
+
+    保留集合按 (created_at DESC, id DESC) 选取（created_at 并列时以 id
+    倒序决胜，与“最近一次分析”语义一致）；不在保留集合内的分析及其在
+    idempotency_keys 中的登记行在同一个事务内删除，任一步失败即整体回滚，
+    不会出现分析已删而幂等键残留（或反之）的中间状态。
+
+    返回 (按 id 升序的已删除分析 ID 列表, 清理后剩余条数)；站点不存在时
+    返回 None（不执行任何删除）。分析总数不超过 keep 时删除列表为空。
+    """
+    with connect() as con:
+        site = con.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone()
+        if site is None:
+            return None
+        rows = con.execute(
+            "SELECT id FROM analyses"
+            " WHERE site_id = ? AND id NOT IN ("
+            "  SELECT id FROM analyses WHERE site_id = ?"
+            "  ORDER BY created_at DESC, id DESC LIMIT ?"
+            ") ORDER BY id",
+            (site_id, site_id, keep),
+        ).fetchall()
+        deleted_ids = [r["id"] for r in rows]
+        if deleted_ids:
+            placeholders = ",".join("?" for _ in deleted_ids)
+            # 先显式删除幂等登记行，再删分析；两条 DELETE 在同一事务内，
+            # 任一失败随 with 上下文整体回滚。
+            con.execute(
+                f"DELETE FROM idempotency_keys"
+                f" WHERE site_id = ? AND analysis_id IN ({placeholders})",
+                (site_id, *deleted_ids),
+            )
+            con.execute(
+                f"DELETE FROM analyses WHERE id IN ({placeholders})",
+                deleted_ids,
+            )
+        remaining = con.execute(
+            "SELECT COUNT(*) AS n FROM analyses WHERE site_id = ?", (site_id,)
+        ).fetchone()["n"]
+    return deleted_ids, remaining
+
+
 # ---------------------------------------------------------------- 跨站点批量查询
 
 def fetch_existing_site_ids(site_ids: list[int]) -> set[int]:

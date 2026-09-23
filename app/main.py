@@ -25,6 +25,7 @@ from .schemas import (
     DriftRiskResult,
     MitigationPlan,
     ProductOut,
+    RetentionResult,
     RiskGroup,
     SiteAnalysisRef,
     SiteCreate,
@@ -265,6 +266,41 @@ def list_site_analyses(site_id: int) -> list[AnalysisMeta]:
     if database.fetch_site(site_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
     return database.list_analyses(site_id)
+
+
+@app.delete(
+    "/sites/{site_id}/analyses/retention",
+    response_model=RetentionResult,
+    tags=["analysis"],
+    summary="清理分析历史：仅保留最近 keep 条分析",
+    description=(
+        "按 **created_at、id 倒序**保留该站点最近 keep 条分析，删除更旧的分析"
+        "记录及其在 idempotency_keys 中的幂等登记行。删除在**同一个数据库事务**"
+        "内完成：任一步失败整批回滚，不会出现分析已删而幂等键残留（或反之）的"
+        "中间状态。响应含 deleted_analysis_ids（按 id 升序）与 remaining_count"
+        "（清理后剩余条数）。分析总数不超过 keep 时删除列表为空（不报错）。"
+        "keep 取 1～100 的正整数（缺失、越界或非整数 → 422）；站点不存在 → 404。"
+    ),
+)
+def prune_site_analyses(
+    site_id: int,
+    keep: int = Query(
+        ...,
+        ge=1,
+        le=100,
+        description="保留的最近分析条数，取 1～100 的正整数（按 created_at、id 倒序保留）",
+    ),
+) -> RetentionResult:
+    result = database.prune_analyses(site_id, keep)
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"site {site_id} not found")
+    deleted_ids, remaining_count = result
+    return RetentionResult(
+        site_id=site_id,
+        keep=keep,
+        deleted_analysis_ids=deleted_ids,
+        remaining_count=remaining_count,
+    )
 
 
 @app.get(

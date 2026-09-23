@@ -387,11 +387,241 @@ def test_concurrent_requests_with_same_idempotency_key_produce_one_result(
         server_thread.join(timeout=5)
 
 
+# ---------------------------------------------------------------- 分析历史保留清理
+
+def _create_n_analyses(client, site_id, n, idempotent=True):
+    """为站点依次创建 n 条分析（各带唯一幂等键），返回分析 id 升序列表。"""
+    ids = []
+    for i in range(n):
+        if idempotent:
+            resp = client.post(
+                f"/sites/{site_id}/analysis", headers={"Idempotency-Key": f"run-{i:03d}"}
+            )
+            assert resp.status_code == 201, resp.text
+        else:
+            resp = client.post(f"/sites/{site_id}/analysis")
+            assert resp.status_code == 201, resp.text
+        ids.append(resp.json()["analysis_id"])
+    return ids
+
+
+def test_retention_keeps_recent_and_reports_counts(client):
+    # keep=3：5 条分析中最旧 2 条被删（按 created_at、id 倒序保留最近 3 条）
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 5)
+    resp = client.delete("/sites/1/analyses/retention", params={"keep": 3})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "site_id": 1,
+        "keep": 3,
+        "deleted_analysis_ids": [ids[0], ids[1]],  # 按 id 升序
+        "remaining_count": 3,
+    }
+    # 剩余的恰好是最近 3 条；最近分析接口与按 id 查询均一致
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == ids[2:]
+    assert client.get("/sites/1/analysis").json()["analysis_id"] == ids[-1]
+    assert client.get(f"/analyses/{ids[0]}").status_code == 404
+    assert client.get(f"/analyses/{ids[-1]}").status_code == 200
+
+
+def test_retention_keep_one_deletes_all_but_latest(client):
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 4)
+    body = client.delete("/sites/1/analyses/retention", params={"keep": 1}).json()
+    assert body["deleted_analysis_ids"] == ids[:-1]
+    assert body["remaining_count"] == 1
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == [ids[-1]]
+
+
+def test_retention_no_delete_when_at_or_below_keep(client):
+    # 分析总数不超过 keep：删除列表为空，不报错
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 2)
+    resp = client.delete("/sites/1/analyses/retention", params={"keep": 2})
+    assert resp.status_code == 200
+    assert resp.json()["deleted_analysis_ids"] == []
+    assert resp.json()["remaining_count"] == 2
+    # keep=100（上限）同样不删除
+    resp2 = client.delete("/sites/1/analyses/retention", params={"keep": 100})
+    assert resp2.json() == {
+        "site_id": 1,
+        "keep": 100,
+        "deleted_analysis_ids": [],
+        "remaining_count": 2,
+    }
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == ids
+
+
+def test_retention_on_site_without_analysis(client):
+    # 站点存在但无任何分析：空删除，remaining_count=0
+    client.post("/sites", json=make_payload())
+    resp = client.delete("/sites/1/analyses/retention", params={"keep": 1})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "site_id": 1,
+        "keep": 1,
+        "deleted_analysis_ids": [],
+        "remaining_count": 0,
+    }
+
+
+def test_retention_deletes_idempotency_keys_of_old_analyses(client):
+    # 被删分析的幂等登记行同步删除：同键再次请求会作为新的首次请求（201）
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 3)
+    assert client.delete(
+        "/sites/1/analyses/retention", params={"keep": 1}
+    ).json()["deleted_analysis_ids"] == ids[:-1]
+    # 已删分析对应的旧键重放 -> 重新执行并产生新记录（201）
+    retry = client.post("/sites/1/analysis", headers={"Idempotency-Key": "run-000"})
+    assert retry.status_code == 201, retry.text
+    new_id = retry.json()["analysis_id"]
+    assert new_id not in ids
+    assert client.post(
+        "/sites/1/analysis", headers={"Idempotency-Key": "run-000"}
+    ).json()["analysis_id"] == new_id
+    # 保留分析的幂等键不受影响：仍是 200 重放，不产生新记录
+    kept_replay = client.post(
+        "/sites/1/analysis", headers={"Idempotency-Key": "run-002"}
+    )
+    assert kept_replay.status_code == 200
+    assert kept_replay.json()["analysis_id"] == ids[-1]
+
+
+def test_retention_is_scoped_per_site(client):
+    # 清理一个站点不影响其他站点的分析与幂等键
+    client.post("/sites", json=make_payload())
+    client.post("/sites", json=make_payload(name="site-b"))
+    ids1 = _create_n_analyses(client, 1, 3)
+    ids2 = _create_n_analyses(client, 2, 2)
+    body = client.delete("/sites/1/analyses/retention", params={"keep": 1}).json()
+    assert body["deleted_analysis_ids"] == ids1[:-1]
+    assert body["remaining_count"] == 1
+    assert [m["analysis_id"] for m in client.get("/sites/2/analyses").json()] == ids2
+    # 站点 2 的幂等键仍可重放
+    replay2 = client.post("/sites/2/analysis", headers={"Idempotency-Key": "run-000"})
+    assert replay2.status_code == 200
+    assert replay2.json()["analysis_id"] == ids2[0]
+
+
+def test_retention_orders_by_created_at_then_id(client):
+    # 保留顺序以 created_at 为主、id 为辅：id 较大但 created_at 更旧的记录
+    # 应先被删除；created_at 并列时再按 id 倒序保留。
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 3)
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        # 把中间 id 的记录改得最旧：保留顺序变为 ids[2](最新) > ids[0] > ids[1]
+        con.execute(
+            "UPDATE analyses SET created_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+            (ids[1],),
+        )
+        # ids[0] 与 ids[2] 置为同一时刻：按 id 倒序应保留 ids[2]
+        con.execute(
+            "UPDATE analyses SET created_at = '2026-01-01T00:00:00.000Z' WHERE id IN (?, ?)",
+            (ids[0], ids[2]),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    body = client.delete("/sites/1/analyses/retention", params={"keep": 2}).json()
+    assert body["deleted_analysis_ids"] == [ids[1]]  # created_at 最旧的先删
+    assert body["remaining_count"] == 2
+    # 尽管 ids[0] 的 id 更小，但 created_at 较新故被保留；并列时刻中 id 较大者为最新
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == [
+        ids[0],
+        ids[2],
+    ]
+    assert client.get("/sites/1/analysis").json()["analysis_id"] == ids[2]
+
+    # 剩余两条 created_at 相同：keep=1 时按 id 倒序保留 ids[2]
+    body = client.delete("/sites/1/analyses/retention", params={"keep": 1}).json()
+    assert body["deleted_analysis_ids"] == [ids[0]]
+    assert body["remaining_count"] == 1
+    assert client.get("/sites/1/analysis").json()["analysis_id"] == ids[2]
+
+    # 只剩 1 条，幂等再清理无删除
+    again = client.delete("/sites/1/analyses/retention", params={"keep": 1}).json()
+    assert again["deleted_analysis_ids"] == []
+    assert again["remaining_count"] == 1
+
+
+def test_retention_404_missing_site(client):
+    assert client.delete(
+        "/sites/999/analyses/retention", params={"keep": 1}
+    ).status_code == 404
+    # 站点不存在时参数仍先通过校验；非法 keep 优先返回 422 而不是 404
+    assert client.delete(
+        "/sites/999/analyses/retention", params={"keep": 0}
+    ).status_code == 422
+
+
+def test_retention_422_invalid_keep(client):
+    client.post("/sites", json=make_payload())
+    url = "/sites/1/analyses/retention"
+    # 缺少 keep
+    assert client.delete(url).status_code == 422
+    # 越界（0、负数、101）/ 非整数 -> 422
+    for bad in (0, -1, 101, 1000, "abc", 1.5):
+        assert client.delete(url, params={"keep": bad}).status_code == 422, bad
+    # 边界值 1 与 100 合法
+    assert client.delete(url, params={"keep": 1}).status_code == 200
+    assert client.delete(url, params={"keep": 100}).status_code == 200
+
+
+def test_retention_rolls_back_whole_batch_on_failure(client, monkeypatch):
+    # 删除过程中任一步失败：分析与幂等键登记行整批回滚，数据恢复原样。
+    # 通过 SQL 触发器令 idempotency_keys 的 DELETE 在存在登记行时抛错。
+    client.post("/sites", json=make_payload())
+    ids = _create_n_analyses(client, 1, 3)
+
+    import sqlite3
+
+    from app import database
+
+    con = sqlite3.connect(database.db_path())
+    try:
+        con.execute(
+            "CREATE TRIGGER fail_idempotency_delete BEFORE DELETE ON idempotency_keys"
+            " BEGIN"
+            "   SELECT RAISE(ABORT, 'injected delete failure');"
+            " END"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with pytest.raises(Exception, match="injected delete failure"):
+        client.delete("/sites/1/analyses/retention", params={"keep": 1})
+
+    # 分析记录一条不少
+    assert [m["analysis_id"] for m in client.get("/sites/1/analyses").json()] == ids
+    # 幂等登记行同样回滚：旧键仍 200 重放到原分析，而非重新执行
+    replay = client.post("/sites/1/analysis", headers={"Idempotency-Key": "run-000"})
+    assert replay.status_code == 200
+    assert replay.json()["analysis_id"] == ids[0]
+
+    # 触发器移除后清理可正常完成
+    con = sqlite3.connect(database.db_path())
+    try:
+        con.execute("DROP TRIGGER fail_idempotency_delete")
+        con.commit()
+    finally:
+        con.close()
+    body = client.delete("/sites/1/analyses/retention", params={"keep": 1}).json()
+    assert body["deleted_analysis_ids"] == ids[:-1]
+    assert body["remaining_count"] == 1
+
+
 # ---------------------------------------------------------------- 风险分组
 
 def test_risk_groups_404(client):
     assert client.get("/analyses/999/risk-groups").status_code == 404
-
 
 def test_risk_groups_empty_when_no_violation(client):
     # guard_interval_hz=0：distance < 0 永不成立，无违规产物 -> 空列表
